@@ -45,18 +45,26 @@ class AutoloadFeedField:
     auto_value: str | None = None
 
 
+def _node_children(node: dict[str, Any]) -> list[dict[str, Any]]:
+    nested = node.get("nested") or node.get("children") or node.get("items") or []
+    return nested if isinstance(nested, list) else []
+
+
 def _walk_tree_nodes(
     nodes: list[dict[str, Any]],
     *,
     parent_path: str = "",
 ) -> list[CategoryOption]:
+    """Только конечные категории — API /fields работает лишь для leaf-узлов."""
     result: list[CategoryOption] = []
     for node in nodes:
         name = str(node.get("name") or node.get("title") or "").strip()
         slug = str(node.get("slug") or node.get("code") or "").strip()
         path = f"{parent_path} / {name}" if parent_path else name
-        nested = node.get("nested") or node.get("children") or node.get("items") or []
-        if slug:
+        children = _node_children(node)
+        if children:
+            result.extend(_walk_tree_nodes(children, parent_path=path))
+        elif slug:
             result.append(
                 CategoryOption(
                     slug=slug,
@@ -64,8 +72,6 @@ def _walk_tree_nodes(
                     leaf_name=name,
                 )
             )
-        if isinstance(nested, list):
-            result.extend(_walk_tree_nodes(nested, parent_path=path))
     return result
 
 

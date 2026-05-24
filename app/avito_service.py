@@ -71,6 +71,29 @@ class ImportResult:
     skipped: int
 
 
+@dataclass(frozen=True)
+class WalletBalance:
+    real: float
+    bonus: float
+    total: float
+
+
+@dataclass(frozen=True)
+class PublishQuote:
+    balance: WalletBalance
+    cost_per_listing: float
+    listings_count: int
+    category_slug: str = ""
+
+    @property
+    def total_cost(self) -> float:
+        return round(self.cost_per_listing * self.listings_count, 2)
+
+    @property
+    def can_afford(self) -> bool:
+        return self.balance.total >= self.total_cost
+
+
 class AvitoService:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
@@ -78,6 +101,62 @@ class AvitoService:
 
     def _client(self) -> AvitoClient:
         return create_avito_client(self.config)
+
+    def fetch_balance(self) -> WalletBalance:
+        logger.info("Запрос баланса кошелька Avito")
+        with self._client() as client:
+            user_id = self.resolve_user_id(client)
+            account_balance = client.account(user_id=user_id).get_balance()
+            real = float(account_balance.real or 0)
+            bonus = float(account_balance.bonus or 0)
+            total = float(account_balance.total if account_balance.total is not None else real + bonus)
+            balance = WalletBalance(real=real, bonus=bonus, total=total)
+            logger.info(
+                "Баланс получен: real=%.2f bonus=%.2f total=%.2f",
+                balance.real,
+                balance.bonus,
+                balance.total,
+            )
+            return balance
+
+    def resolve_publish_cost_per_listing(self, category_slug: str) -> float:
+        if category_slug and self.config.category_publish_costs:
+            cached = self.config.category_publish_costs.get(category_slug)
+            if cached and cached > 0:
+                return float(cached)
+        if self.config.publish_cost_per_listing > 0:
+            return float(self.config.publish_cost_per_listing)
+        raise AvitoError(
+            "Не задана ориентировочная стоимость размещения. "
+            "Укажите её на вкладке «Настройки» (поле «Стоимость размещения, ₽»)."
+        )
+
+    def build_publish_quote(self, *, listings_count: int, category_slug: str) -> PublishQuote:
+        if listings_count <= 0:
+            raise AvitoError("Нет объявлений для публикации.")
+        balance = self.fetch_balance()
+        cost_per_listing = self.resolve_publish_cost_per_listing(category_slug)
+        quote = PublishQuote(
+            balance=balance,
+            cost_per_listing=cost_per_listing,
+            listings_count=listings_count,
+            category_slug=category_slug,
+        )
+        logger.info(
+            "Проверка публикации: balance=%.2f cost=%.2f listings=%s affordable=%s",
+            quote.balance.total,
+            quote.total_cost,
+            listings_count,
+            quote.can_afford,
+        )
+        return quote
+
+    def remember_category_publish_cost(self, category_slug: str, cost: float) -> None:
+        if not category_slug or cost <= 0:
+            return
+        costs = dict(self.config.category_publish_costs or {})
+        costs[category_slug] = round(cost, 2)
+        self.config.category_publish_costs = costs
 
     def resolve_user_id(self, client: AvitoClient) -> int:
         if self.config.user_id:

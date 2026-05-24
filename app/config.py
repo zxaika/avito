@@ -40,6 +40,8 @@ class AppConfig:
     auto_archive_enabled: bool = False
     scheduler_enabled: bool = False
     scheduler_interval_minutes: int = 60
+    publish_cost_per_listing: float = 0.0
+    category_publish_costs: dict[str, float] | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -60,6 +62,12 @@ class AppConfig:
             auto_archive_enabled=bool(data.get("auto_archive_enabled", False)),
             scheduler_enabled=bool(data.get("scheduler_enabled", False)),
             scheduler_interval_minutes=int(data.get("scheduler_interval_minutes", 60)),
+            publish_cost_per_listing=float(data.get("publish_cost_per_listing", 0) or 0),
+            category_publish_costs={
+                str(key): float(value)
+                for key, value in (data.get("category_publish_costs") or {}).items()
+            }
+            or None,
         )
 
 

@@ -9,7 +9,7 @@ from PyQt5.QtCore import QObject, pyqtSignal
 
 from avito.ads.models import Listing
 
-from app.avito_service import AvitoService, ListingWithStats, PublishResult
+from app.avito_service import AvitoService, ListingWithStats, PublishQuote, PublishResult, WalletBalance
 from app.config import AppConfig, load_config
 from app.database import DraftListing
 from app.excel_export import export_listings_report
@@ -51,6 +51,48 @@ class AnalyzeWorker(QObject):
             self.finished.emit(rows)
         except Exception as exc:  # noqa: BLE001
             self.error.emit(log_exception(logger, "Ошибка загрузки объявлений", exc))
+
+
+class BalanceWorker(QObject):
+    finished = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+    def __init__(self, config: AppConfig) -> None:
+        super().__init__()
+        self._config = config
+
+    def run(self) -> None:
+        try:
+            balance = AvitoService(load_config()).fetch_balance()
+            self.finished.emit(balance)
+        except Exception as exc:  # noqa: BLE001
+            self.error.emit(log_exception(logger, "Ошибка загрузки баланса", exc))
+
+
+class PublishPrecheckWorker(QObject):
+    finished = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+    def __init__(self, config: AppConfig, listings_count: int, category_slug: str) -> None:
+        super().__init__()
+        self._config = config
+        self._listings_count = listings_count
+        self._category_slug = category_slug
+
+    def run(self) -> None:
+        logger.info(
+            "PublishPrecheckWorker: listings=%s category=%s",
+            self._listings_count,
+            self._category_slug,
+        )
+        try:
+            quote = AvitoService(load_config()).build_publish_quote(
+                listings_count=self._listings_count,
+                category_slug=self._category_slug,
+            )
+            self.finished.emit(quote)
+        except Exception as exc:  # noqa: BLE001
+            self.error.emit(log_exception(logger, "Ошибка проверки баланса", exc))
 
 
 class PublishWorker(QObject):

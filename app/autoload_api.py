@@ -7,8 +7,10 @@ from typing import Any
 import httpx
 
 from app.config import AppConfig, apply_config_to_env
+from app.logging_setup import get_logger
 
 AUTOLOAD_BASE = "https://api.avito.ru"
+logger = get_logger("autoload")
 
 
 def _fetch_token(http: httpx.Client, config: AppConfig) -> str:
@@ -32,6 +34,13 @@ def autoload_get(config: AppConfig, path: str) -> dict[str, Any]:
             f"{AUTOLOAD_BASE}{path}",
             headers={"Authorization": f"Bearer {token}"},
         )
+        if response.status_code >= 400:
+            logger.error(
+                "Autoload API %s: HTTP %s — %s",
+                path,
+                response.status_code,
+                response.text[:500],
+            )
         response.raise_for_status()
         payload = response.json()
         if not isinstance(payload, dict):

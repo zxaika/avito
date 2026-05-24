@@ -33,7 +33,14 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from app.avito_service import ImportResult, ListingWithStats, PublishResult, parse_comma_separated
+from app.avito_service import (
+    ImportResult,
+    ListingWithStats,
+    PublishQuote,
+    PublishResult,
+    WalletBalance,
+    parse_comma_separated,
+)
 from app.config import AppConfig, load_config, save_config
 from app.database import DraftListing, init_db
 from app.logging_setup import get_log_file, get_logger
@@ -41,10 +48,12 @@ from app.workers import (
     AnalyzeWorker,
     ArchiveRequest,
     ArchiveWorker,
+    BalanceWorker,
     CategoryFieldsWorker,
     CategoryTreeWorker,
     ExportExcelWorker,
     ImportWorker,
+    PublishPrecheckWorker,
     PublishWorker,
 )
 
@@ -74,6 +83,9 @@ class MainWindow(QMainWindow):
         self._rows: list[ListingWithStats] = []
         self._category_field_inputs: dict[str, QLineEdit] = {}
         self._category_auto_fields: dict[str, str] = {}
+        self._pending_publish_items: list[DraftListing] = []
+        self._current_balance: WalletBalance | None = None
+        self._balance_show_error_dialog = True
 
         logger.info(
             "Конфиг: client_id=%s user_id=%s",
@@ -85,7 +97,21 @@ class MainWindow(QMainWindow):
         self.resize(1150, 760)
 
         self.tabs = QTabWidget()
-        self.setCentralWidget(self.tabs)
+
+        wallet_row = QHBoxLayout()
+        self.balance_label = QLabel("Кошелёк Avito: —")
+        self.balance_label.setWordWrap(True)
+        self.refresh_balance_btn = QPushButton("Обновить баланс")
+        self.refresh_balance_btn.clicked.connect(self._refresh_balance)
+        wallet_row.addWidget(self.balance_label, stretch=1)
+        wallet_row.addWidget(self.refresh_balance_btn)
+
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(8, 8, 8, 8)
+        container_layout.addLayout(wallet_row)
+        container_layout.addWidget(self.tabs)
+        self.setCentralWidget(container)
 
         self._build_ads_tab()
         self._build_create_tab()
@@ -108,6 +134,7 @@ class MainWindow(QMainWindow):
             self.status.showMessage("Укажите API-ключи в настройках или .env")
             return
         self.status.showMessage("Загрузка объявлений...")
+        self._refresh_balance(show_credentials_warning=False)
         self._load_categories(show_credentials_warning=False)
         self._start_analyze(show_credentials_warning=False)
 
@@ -294,6 +321,18 @@ class MainWindow(QMainWindow):
         feed_form.addRow("Телефон по умолчанию", self.contact_phone_setting)
         feed_form.addRow("Категория по умолчанию", self.default_category_label)
 
+        wallet_box = QGroupBox("Кошелёк и публикация")
+        wallet_form = QFormLayout(wallet_box)
+        self.publish_cost_input = QSpinBox()
+        self.publish_cost_input.setRange(0, 999_999)
+        self.publish_cost_input.setSuffix(" ₽")
+        self.publish_cost_input.setValue(int(self.config.publish_cost_per_listing))
+        self.publish_cost_input.setToolTip(
+            "Ориентировочная стоимость размещения одного объявления в одном городе. "
+            "Avito не предоставляет API для точного расчёта до публикации."
+        )
+        wallet_form.addRow("Стоимость размещения, ₽", self.publish_cost_input)
+
         rules_box = QGroupBox("Правила снятия по просмотрам")
         rules_form = QFormLayout(rules_box)
         self.period_spin = QSpinBox()
@@ -328,6 +367,7 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(api_box)
         layout.addWidget(feed_box)
+        layout.addWidget(wallet_box)
         layout.addWidget(rules_box)
         layout.addWidget(sched_box)
         layout.addWidget(save_btn)
@@ -382,8 +422,8 @@ class MainWindow(QMainWindow):
         self.category_combo.blockSignals(False)
         self.load_cat_btn.setEnabled(True)
         self.status.showMessage(f"Загружено категорий: {len(categories)}")
-        if self.category_combo.currentData():
-            self._load_category_fields(str(self.category_combo.currentData()))
+        if self.config.default_category_slug:
+            self._load_category_fields(self.config.default_category_slug)
 
     def _on_category_changed(self, _index: int) -> None:
         slug = self.category_combo.currentData()
@@ -426,6 +466,50 @@ class MainWindow(QMainWindow):
             self._category_field_inputs[tag] = input_widget
             self.category_fields_layout.addRow(label, input_widget)
 
+    # ------------------------------------------------------------------ wallet
+
+    def _format_balance(self, balance: WalletBalance) -> str:
+        parts = [f"Кошелёк Avito: {balance.real:,.2f} ₽".replace(",", " ")]
+        if balance.bonus > 0:
+            parts.append(f"бонусы: {balance.bonus:,.2f} ₽".replace(",", " "))
+        parts.append(f"всего: {balance.total:,.2f} ₽".replace(",", " "))
+        return " · ".join(parts)
+
+    def _update_balance_label(self, balance: WalletBalance | None = None) -> None:
+        if balance is not None:
+            self._current_balance = balance
+        if self._current_balance is None:
+            self.balance_label.setText("Кошелёк Avito: —")
+            return
+        self.balance_label.setText(self._format_balance(self._current_balance))
+
+    def _refresh_balance(self, *, show_credentials_warning: bool = True) -> None:
+        if not self._validate_api_config(show_warning=show_credentials_warning):
+            return
+        self._balance_show_error_dialog = show_credentials_warning
+        self.refresh_balance_btn.setEnabled(False)
+        self.balance_label.setText("Кошелёк Avito: загрузка...")
+        worker = BalanceWorker(self.config)
+        thread = QThread()
+        self._run_worker(
+            worker,
+            thread,
+            on_finished=self._on_balance_loaded,
+            on_error=self._on_balance_error,
+        )
+
+    def _on_balance_loaded(self, balance: WalletBalance) -> None:
+        self._update_balance_label(balance)
+        self.refresh_balance_btn.setEnabled(True)
+        logger.info("Баланс обновлён в UI: total=%.2f", balance.total)
+
+    def _on_balance_error(self, message: str) -> None:
+        self.refresh_balance_btn.setEnabled(True)
+        self.balance_label.setText("Кошелёк Avito: ошибка загрузки")
+        logger.error("Ошибка баланса в UI: %s", message.replace("\n", " | "))
+        if self._balance_show_error_dialog:
+            QMessageBox.warning(self, "Баланс", message)
+
     # ------------------------------------------------------------------ settings
 
     def _save_settings(self) -> None:
@@ -446,6 +530,8 @@ class MainWindow(QMainWindow):
             auto_archive_enabled=self.auto_archive_check.isChecked(),
             scheduler_enabled=self.scheduler_check.isChecked(),
             scheduler_interval_minutes=self.scheduler_interval_spin.value(),
+            publish_cost_per_listing=float(self.publish_cost_input.value()),
+            category_publish_costs=self.config.category_publish_costs,
         )
         save_config(self.config)
         self.phone_input.setText(self.config.contact_phone)
@@ -732,12 +818,74 @@ class MainWindow(QMainWindow):
             self.config.default_category_path = category_path
             save_config(self.config)
 
+        self._pending_publish_items = items
         busy_msg = (
-            f"Публикация объявления в {len(cities)} городах..."
+            f"Проверка баланса для {len(cities)} объявлений..."
             if len(cities) > 1
-            else "Публикация объявления..."
+            else "Проверка баланса перед публикацией..."
         )
         self._set_busy(True, busy_msg)
+        worker = PublishPrecheckWorker(
+            self.config,
+            listings_count=len(items),
+            category_slug=str(category_slug),
+        )
+        thread = QThread()
+        self._run_worker(
+            worker,
+            thread,
+            on_finished=self._on_publish_precheck_finished,
+            on_error=self._on_worker_error,
+        )
+
+    def _on_publish_precheck_finished(self, quote: PublishQuote) -> None:
+        if not quote.can_afford:
+            self._set_busy(False, "Публикация отменена: недостаточно средств")
+            QMessageBox.critical(
+                self,
+                "Недостаточно средств",
+                (
+                    f"На кошельке Avito недостаточно средств для публикации.\n\n"
+                    f"Баланс: {quote.balance.total:,.2f} ₽\n"
+                    f"Требуется: {quote.total_cost:,.2f} ₽ "
+                    f"({quote.listings_count} × {quote.cost_per_listing:,.2f} ₽)\n"
+                    f"Не хватает: {quote.total_cost - quote.balance.total:,.2f} ₽"
+                ).replace(",", " "),
+            )
+            self._pending_publish_items = []
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Подтверждение публикации",
+            (
+                f"Публикация спишет средства с кошелька Avito.\n\n"
+                f"Баланс: {quote.balance.total:,.2f} ₽\n"
+                f"Стоимость: {quote.total_cost:,.2f} ₽ "
+                f"({quote.listings_count} × {quote.cost_per_listing:,.2f} ₽)\n"
+                f"После публикации останется: {quote.balance.total - quote.total_cost:,.2f} ₽\n\n"
+                f"Продолжить?"
+            ).replace(",", " "),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            self._set_busy(False, "Публикация отменена пользователем")
+            self._pending_publish_items = []
+            return
+
+        items = self._pending_publish_items
+        self._pending_publish_items = []
+        if not items:
+            self._set_busy(False, "Нет объявлений для публикации")
+            return
+
+        busy_msg = (
+            f"Публикация объявления в {len(items)} городах..."
+            if len(items) > 1
+            else "Публикация объявления..."
+        )
+        self.status.showMessage(busy_msg)
         worker = PublishWorker(self.config, items)
         thread = QThread()
         self._run_worker(
@@ -760,6 +908,7 @@ class MainWindow(QMainWindow):
             msg += f"\nЗагрузка запущена, отчёт #{result.report_id}"
         QMessageBox.information(self, "Публикация", msg)
         self._set_busy(False, msg.replace("\n", " "))
+        self._refresh_balance(show_credentials_warning=False)
         self.title_input.clear()
         self.description_input.clear()
         self.price_input.setValue(0)
@@ -789,6 +938,7 @@ class MainWindow(QMainWindow):
         self.import_btn.setEnabled(not busy)
         self.export_btn.setEnabled(not busy)
         self.auto_archive_btn.setEnabled(not busy)
+        self.refresh_balance_btn.setEnabled(not busy)
         self.status.showMessage(message)
 
 
