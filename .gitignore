@@ -3,3 +3,5 @@
 __pycache__/
 *.pyc
 active_ads_*.csv
+*.xlsx
+reports/
