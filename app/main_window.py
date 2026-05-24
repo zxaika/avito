@@ -41,6 +41,7 @@ from app.avito_service import (
     WalletBalance,
     parse_comma_separated,
 )
+from app.category_field_widgets import CheckboxFieldWidget
 from app.category_templates import LISTING_FEE_LABELS
 from app.config import AppConfig, load_config, save_config
 from app.database import DraftListing, init_db
@@ -108,6 +109,7 @@ class MainWindow(QMainWindow):
         self._build_ads_tab()
         self._build_create_tab()
         self._build_finance_tab()
+        self._build_stats_tab()
         self._build_settings_tab()
 
         self.status = QStatusBar()
@@ -175,42 +177,32 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(widget)
 
         header = QLabel(
-            "Активные объявления и аналитика просмотров. "
-            "Импорт в фид позволяет снимать объявления через автозагрузку."
+            "Активные объявления. Импорт в фид позволяет снимать объявления через автозагрузку. "
+            "Статистика просмотров — на вкладке «Статистика»."
         )
         header.setWordWrap(True)
         layout.addWidget(header)
 
         btn_row = QHBoxLayout()
-        self.refresh_btn = QPushButton("Обновить данные")
+        self.refresh_btn = QPushButton("Обновить список")
         self.refresh_btn.clicked.connect(self._start_analyze)
         self.import_btn = QPushButton("Импортировать в фид")
         self.import_btn.clicked.connect(self._import_selected)
-        self.export_btn = QPushButton("Экспорт в Excel")
-        self.export_btn.clicked.connect(self._export_excel)
         self.open_log_btn = QPushButton("Открыть лог")
         self.open_log_btn.clicked.connect(self._open_log_file)
-        self.auto_archive_btn = QPushButton("Снять просевшие (из фида)")
-        self.auto_archive_btn.clicked.connect(self._archive_flagged)
         btn_row.addWidget(self.refresh_btn)
         btn_row.addWidget(self.import_btn)
-        btn_row.addWidget(self.export_btn)
         btn_row.addWidget(self.open_log_btn)
-        btn_row.addWidget(self.auto_archive_btn)
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
-        self.ads_table = QTableWidget(0, 10)
+        self.ads_table = QTableWidget(0, 6)
         self.ads_table.setHorizontalHeaderLabels(
             [
                 "ID",
                 "Категория",
                 "Заголовок",
                 "Цена",
-                "Просмотры",
-                "Было",
-                "Δ %",
-                "Статус",
                 "В фиде",
                 "Действие",
             ]
@@ -324,6 +316,88 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(widget, "Финансы")
 
+    def _build_stats_tab(self) -> None:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        self.stats_summary_label = QLabel(
+            f"Период анализа: {self.config.stats_period_days} дн. "
+            "Нажмите «Обновить статистику» для загрузки данных."
+        )
+        self.stats_summary_label.setWordWrap(True)
+        layout.addWidget(self.stats_summary_label)
+
+        btn_row = QHBoxLayout()
+        self.stats_refresh_btn = QPushButton("Обновить статистику")
+        self.stats_refresh_btn.clicked.connect(self._start_analyze)
+        self.stats_export_btn = QPushButton("Экспорт в Excel")
+        self.stats_export_btn.clicked.connect(self._export_excel)
+        self.stats_archive_btn = QPushButton("Снять просевшие (из фида)")
+        self.stats_archive_btn.clicked.connect(self._archive_flagged)
+        btn_row.addWidget(self.stats_refresh_btn)
+        btn_row.addWidget(self.stats_export_btn)
+        btn_row.addWidget(self.stats_archive_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        self.stats_table = QTableWidget(0, 8)
+        self.stats_table.setHorizontalHeaderLabels(
+            [
+                "ID",
+                "Заголовок",
+                "Категория",
+                "Просмотры",
+                "Было",
+                "Δ %",
+                "Контакты",
+                "Статус",
+            ]
+        )
+        self.stats_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.stats_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.stats_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.stats_table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self.stats_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        layout.addWidget(self.stats_table)
+
+        rules_box = QGroupBox("Правила снятия по просмотрам")
+        rules_form = QFormLayout(rules_box)
+        self.period_spin = QSpinBox()
+        self.period_spin.setRange(1, 30)
+        self.period_spin.setValue(self.config.stats_period_days)
+        self.baseline_spin = QSpinBox()
+        self.baseline_spin.setRange(0, 1000)
+        self.baseline_spin.setValue(self.config.min_views_baseline)
+        self.drop_spin = QSpinBox()
+        self.drop_spin.setRange(1, 99)
+        self.drop_spin.setValue(self.config.drop_percent_threshold)
+        self.auto_archive_check = QCheckBox("Автоматически снимать при обновлении")
+        self.auto_archive_check.setChecked(self.config.auto_archive_enabled)
+        rules_form.addRow("Период анализа, дней", self.period_spin)
+        rules_form.addRow("Мин. просмотров в прошлом периоде", self.baseline_spin)
+        rules_form.addRow("Падение просмотров, %", self.drop_spin)
+        rules_form.addRow("", self.auto_archive_check)
+
+        sched_box = QGroupBox("Планировщик")
+        sched_form = QFormLayout(sched_box)
+        self.scheduler_check = QCheckBox("Автоматически проверять просмотры")
+        self.scheduler_check.setChecked(self.config.scheduler_enabled)
+        self.scheduler_interval_spin = QSpinBox()
+        self.scheduler_interval_spin.setRange(5, 1440)
+        self.scheduler_interval_spin.setValue(self.config.scheduler_interval_minutes)
+        self.scheduler_interval_spin.setSuffix(" мин")
+        sched_form.addRow("", self.scheduler_check)
+        sched_form.addRow("Интервал проверки", self.scheduler_interval_spin)
+
+        stats_save_btn = QPushButton("Сохранить настройки статистики")
+        stats_save_btn.clicked.connect(self._save_stats_settings)
+
+        layout.addWidget(rules_box)
+        layout.addWidget(sched_box)
+        layout.addWidget(stats_save_btn)
+
+        self.tabs.addTab(widget, "Статистика")
+
     def _build_settings_tab(self) -> None:
         widget = QWidget()
         layout = QVBoxLayout(widget)
@@ -363,43 +437,12 @@ class MainWindow(QMainWindow):
         )
         wallet_form.addRow("Стоимость размещения, ₽", self.publish_cost_input)
 
-        rules_box = QGroupBox("Правила снятия по просмотрам")
-        rules_form = QFormLayout(rules_box)
-        self.period_spin = QSpinBox()
-        self.period_spin.setRange(1, 30)
-        self.period_spin.setValue(self.config.stats_period_days)
-        self.baseline_spin = QSpinBox()
-        self.baseline_spin.setRange(0, 1000)
-        self.baseline_spin.setValue(self.config.min_views_baseline)
-        self.drop_spin = QSpinBox()
-        self.drop_spin.setRange(1, 99)
-        self.drop_spin.setValue(self.config.drop_percent_threshold)
-        self.auto_archive_check = QCheckBox("Автоматически снимать при обновлении")
-        self.auto_archive_check.setChecked(self.config.auto_archive_enabled)
-        rules_form.addRow("Период анализа, дней", self.period_spin)
-        rules_form.addRow("Мин. просмотров в прошлом периоде", self.baseline_spin)
-        rules_form.addRow("Падение просмотров, %", self.drop_spin)
-        rules_form.addRow("", self.auto_archive_check)
-
-        sched_box = QGroupBox("Планировщик")
-        sched_form = QFormLayout(sched_box)
-        self.scheduler_check = QCheckBox("Автоматически проверять просмотры")
-        self.scheduler_check.setChecked(self.config.scheduler_enabled)
-        self.scheduler_interval_spin = QSpinBox()
-        self.scheduler_interval_spin.setRange(5, 1440)
-        self.scheduler_interval_spin.setValue(self.config.scheduler_interval_minutes)
-        self.scheduler_interval_spin.setSuffix(" мин")
-        sched_form.addRow("", self.scheduler_check)
-        sched_form.addRow("Интервал проверки", self.scheduler_interval_spin)
-
         save_btn = QPushButton("Сохранить настройки")
         save_btn.clicked.connect(self._save_settings)
 
         layout.addWidget(api_box)
         layout.addWidget(feed_box)
         layout.addWidget(wallet_box)
-        layout.addWidget(rules_box)
-        layout.addWidget(sched_box)
         layout.addWidget(save_btn)
         layout.addStretch()
 
@@ -414,7 +457,7 @@ class MainWindow(QMainWindow):
             self._scheduler_timer.start(interval_ms)
 
     def _on_scheduler_tick(self) -> None:
-        if self.refresh_btn.isEnabled():
+        if self.stats_refresh_btn.isEnabled():
             self.status.showMessage("Планировщик: проверка просмотров...")
             self._start_analyze()
 
@@ -476,8 +519,13 @@ class MainWindow(QMainWindow):
                 widget.clear()
             elif isinstance(widget, QComboBox):
                 widget.setCurrentIndex(0)
+            elif isinstance(widget, CheckboxFieldWidget):
+                widget.clear_selection()
 
     def _build_category_field_widget(self, field) -> QWidget:
+        if field.field_type == "checkbox" and field.values:
+            return CheckboxFieldWidget(list(field.values))
+
         if field.values:
             combo = QComboBox()
             combo.setEditable(True)
@@ -499,7 +547,9 @@ class MainWindow(QMainWindow):
             input_widget.setText(field.default)
         return input_widget
 
-    def _category_field_value(self, widget: QWidget) -> str:
+    def _category_field_value(self, widget: QWidget) -> str | list[str]:
+        if isinstance(widget, CheckboxFieldWidget):
+            return widget.selected_values()
         if isinstance(widget, QComboBox):
             data = widget.currentData()
             text = widget.currentText().strip()
@@ -576,6 +626,32 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ settings
 
+    def _save_stats_settings(self) -> None:
+        self.config = AppConfig(
+            client_id=self.config.client_id,
+            client_secret=self.config.client_secret,
+            user_id=self.config.user_id,
+            feed_public_url=self.config.feed_public_url,
+            contact_phone=self.config.contact_phone,
+            default_category_slug=self.config.default_category_slug,
+            default_category_path=self.config.default_category_path,
+            publish_cost_per_listing=self.config.publish_cost_per_listing,
+            category_publish_costs=self.config.category_publish_costs,
+            stats_period_days=self.period_spin.value(),
+            min_views_baseline=self.baseline_spin.value(),
+            drop_percent_threshold=self.drop_spin.value(),
+            auto_archive_enabled=self.auto_archive_check.isChecked(),
+            scheduler_enabled=self.scheduler_check.isChecked(),
+            scheduler_interval_minutes=self.scheduler_interval_spin.value(),
+        )
+        save_config(self.config)
+        self._apply_scheduler()
+        self.stats_summary_label.setText(
+            f"Период анализа: {self.config.stats_period_days} дн. "
+            "Настройки сохранены. Нажмите «Обновить статистику»."
+        )
+        self.status.showMessage("Настройки статистики сохранены", 3000)
+
     def _save_settings(self) -> None:
         user_id_raw = self.user_id_input.text().strip()
         slug = self.category_combo.currentData()
@@ -588,20 +664,19 @@ class MainWindow(QMainWindow):
             contact_phone=self.contact_phone_setting.text().strip(),
             default_category_slug=str(slug) if slug else self.config.default_category_slug,
             default_category_path=category_path if slug else self.config.default_category_path,
-            stats_period_days=self.period_spin.value(),
-            min_views_baseline=self.baseline_spin.value(),
-            drop_percent_threshold=self.drop_spin.value(),
-            auto_archive_enabled=self.auto_archive_check.isChecked(),
-            scheduler_enabled=self.scheduler_check.isChecked(),
-            scheduler_interval_minutes=self.scheduler_interval_spin.value(),
             publish_cost_per_listing=float(self.publish_cost_input.value()),
             category_publish_costs=self.config.category_publish_costs,
+            stats_period_days=self.config.stats_period_days,
+            min_views_baseline=self.config.min_views_baseline,
+            drop_percent_threshold=self.config.drop_percent_threshold,
+            auto_archive_enabled=self.config.auto_archive_enabled,
+            scheduler_enabled=self.config.scheduler_enabled,
+            scheduler_interval_minutes=self.config.scheduler_interval_minutes,
         )
         save_config(self.config)
         self.phone_input.setText(self.config.contact_phone)
         if self.config.default_category_path:
             self.default_category_label.setText(self.config.default_category_path)
-        self._apply_scheduler()
         self.status.showMessage("Настройки сохранены", 3000)
 
     def _validate_api_config(self, *, show_warning: bool = True) -> bool:
@@ -635,12 +710,14 @@ class MainWindow(QMainWindow):
     def _on_analyze_partial(self, rows: list) -> None:
         self._rows = rows
         self._fill_ads_table(rows)
+        self._fill_stats_table(rows)
         self.status.showMessage(f"Загружено {len(rows)} объявлений, получаю статистику...")
         logger.info("Таблица обновлена (превью): %s строк", len(rows))
 
     def _on_analyze_finished(self, rows: list) -> None:
         self._rows = rows
         self._fill_ads_table(rows)
+        self._fill_stats_table(rows)
         msg = f"Загружено объявлений: {len(rows)}"
         logger.info(msg)
         self._set_busy(False, msg)
@@ -659,24 +736,47 @@ class MainWindow(QMainWindow):
             self.ads_table.setItem(row_idx, 1, QTableWidgetItem(row.category_display or "—"))
             self.ads_table.setItem(row_idx, 2, QTableWidgetItem(listing.title or ""))
             self.ads_table.setItem(row_idx, 3, QTableWidgetItem(str(listing.price or "")))
-            self.ads_table.setItem(row_idx, 4, QTableWidgetItem(str(row.current_views)))
-            self.ads_table.setItem(row_idx, 5, QTableWidgetItem(str(row.previous_views)))
+
+            feed_item = QTableWidgetItem("Да" if row.in_local_feed else "Нет")
+            self.ads_table.setItem(row_idx, 4, feed_item)
+
+            btn = QPushButton("Снять")
+            btn.setEnabled(row.in_local_feed)
+            btn.clicked.connect(lambda _checked, r=row: self._archive_single(r))
+            self.ads_table.setCellWidget(row_idx, 5, btn)
+
+    def _fill_stats_table(self, rows: list[ListingWithStats]) -> None:
+        self.stats_table.setRowCount(len(rows))
+        total_views = 0
+        total_contacts = 0
+        flagged_count = 0
+        for row_idx, row in enumerate(rows):
+            listing = row.listing
+            item_id = listing.item_id or ""
+            self.stats_table.setItem(row_idx, 0, QTableWidgetItem(str(item_id)))
+            self.stats_table.setItem(row_idx, 1, QTableWidgetItem(listing.title or ""))
+            self.stats_table.setItem(row_idx, 2, QTableWidgetItem(row.category_display or "—"))
+            self.stats_table.setItem(row_idx, 3, QTableWidgetItem(str(row.current_views)))
+            self.stats_table.setItem(row_idx, 4, QTableWidgetItem(str(row.previous_views)))
             delta = "—" if row.views_delta_pct is None else f"{row.views_delta_pct:+.1f}"
-            self.ads_table.setItem(row_idx, 6, QTableWidgetItem(delta))
+            self.stats_table.setItem(row_idx, 5, QTableWidgetItem(delta))
+            self.stats_table.setItem(row_idx, 6, QTableWidgetItem(str(row.current_contacts)))
 
             status = "Просадка" if row.should_archive else "OK"
             status_item = QTableWidgetItem(status)
             if row.should_archive:
                 status_item.setBackground(QColor("#ffe0e0"))
-            self.ads_table.setItem(row_idx, 7, status_item)
+                flagged_count += 1
+            self.stats_table.setItem(row_idx, 7, status_item)
 
-            feed_item = QTableWidgetItem("Да" if row.in_local_feed else "Нет")
-            self.ads_table.setItem(row_idx, 8, feed_item)
+            total_views += row.current_views
+            total_contacts += row.current_contacts
 
-            btn = QPushButton("Снять")
-            btn.setEnabled(row.in_local_feed)
-            btn.clicked.connect(lambda _checked, r=row: self._archive_single(r))
-            self.ads_table.setCellWidget(row_idx, 9, btn)
+        self.stats_summary_label.setText(
+            f"Период анализа: {self.config.stats_period_days} дн. | "
+            f"Объявлений: {len(rows)} | Просмотры: {total_views} | Контакты: {total_contacts} | "
+            f"Просадка: {flagged_count}"
+        )
 
     # ------------------------------------------------------------------ import / export
 
@@ -846,7 +946,10 @@ class MainWindow(QMainWindow):
         extra_fields = dict(self._category_auto_fields)
         for tag, widget in self._category_field_inputs.items():
             value = self._category_field_value(widget)
-            if value:
+            if isinstance(value, list):
+                if value:
+                    extra_fields[tag] = value
+            elif value:
                 extra_fields[tag] = value
 
         cities = parse_comma_separated(self.city_input.text())
@@ -999,8 +1102,9 @@ class MainWindow(QMainWindow):
     def _set_busy(self, busy: bool, message: str) -> None:
         self.refresh_btn.setEnabled(not busy)
         self.import_btn.setEnabled(not busy)
-        self.export_btn.setEnabled(not busy)
-        self.auto_archive_btn.setEnabled(not busy)
+        self.stats_refresh_btn.setEnabled(not busy)
+        self.stats_export_btn.setEnabled(not busy)
+        self.stats_archive_btn.setEnabled(not busy)
         self.refresh_balance_btn.setEnabled(not busy)
         self.status.showMessage(message)
 

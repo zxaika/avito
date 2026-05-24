@@ -25,7 +25,7 @@ class DraftListing:
     avito_item_id: int | None = None
     category_slug: str = ""
     category_path: str = ""
-    extra_fields: dict[str, str] = field(default_factory=dict)
+    extra_fields: dict[str, str | list[str]] = field(default_factory=dict)
     in_feed: bool = True
     status: str = "draft"  # draft | published | archived
     created_at: str = ""

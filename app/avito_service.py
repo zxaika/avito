@@ -38,6 +38,7 @@ from app.database import (
     save_stats_snapshot,
 )
 from app.feed_builder import write_feed_file
+from app.stats_api import fetch_item_stats
 from app.logging_setup import get_logger
 
 logger = get_logger("service")
@@ -270,27 +271,30 @@ class AvitoService:
 
         with self._client() as client:
             user_id = self.resolve_user_id(client)
-            stats_api = client.ad_stats(user_id=user_id)
 
             for index, batch in enumerate(batches, start=1):
                 batch_started = time.perf_counter()
                 logger.info("Пакет %s/%s: item_ids=%s", index, len(batches), batch)
 
-                cur = stats_api.get_item_stats(
+                cur_items = fetch_item_stats(
+                    self.config,
+                    user_id=user_id,
                     date_from=current_start.isoformat(),
                     date_to=current_end.isoformat(),
                     item_ids=batch,
                 )
-                prev = stats_api.get_item_stats(
+                prev_items = fetch_item_stats(
+                    self.config,
+                    user_id=user_id,
                     date_from=previous_start.isoformat(),
                     date_to=previous_end.isoformat(),
                     item_ids=batch,
                 )
 
-                for stat in cur.items:
+                for stat in cur_items:
                     if stat.item_id is not None:
                         current_map[stat.item_id] = stat
-                for stat in prev.items:
+                for stat in prev_items:
                     if stat.item_id is not None:
                         previous_map[stat.item_id] = stat
 
@@ -299,8 +303,8 @@ class AvitoService:
                     index,
                     len(batches),
                     time.perf_counter() - batch_started,
-                    len(cur.items),
-                    len(prev.items),
+                    len(cur_items),
+                    len(prev_items),
                 )
 
         logger.info(
