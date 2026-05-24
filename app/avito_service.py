@@ -13,6 +13,12 @@ from avito.core.exceptions import AvitoError
 
 from app.autoload_api import fetch_category_fields_raw, fetch_category_tree_raw
 from app.avito_client_factory import create_avito_client
+from app.category_templates import (
+    CategoryFieldsBundle,
+    apply_template_fields,
+    get_category_option,
+    get_template_categories,
+)
 from app.category_utils import (
     AutoloadFeedField,
     CategoryMeta,
@@ -198,24 +204,33 @@ class AvitoService:
         return listings
 
     def fetch_category_tree(self) -> list[tuple[str, str]]:
-        logger.info("Загрузка дерева категорий автозагрузки")
+        categories = get_template_categories()
+        logger.info("Категорий из шаблона: %s", len(categories))
+        if categories:
+            return categories
+        logger.info("Шаблон пуст — загрузка полного дерева автозагрузки")
         raw_nodes = fetch_category_tree_raw(self.config)
-        categories = flatten_category_tree(raw_nodes)
-        logger.info("Категорий загружено: %s", len(categories))
-        return categories
+        return flatten_category_tree(raw_nodes)
 
-    def fetch_category_fields(self, node_slug: str) -> list[AutoloadFeedField]:
+    def fetch_category_fields(self, node_slug: str) -> CategoryFieldsBundle:
         logger.info("Загрузка полей категории: %s", node_slug)
         raw_fields = fetch_category_fields_raw(self.config, node_slug)
-        fields = parse_category_fields(raw_fields)
-        logger.info("Полей категории: %s", len(fields))
-        return fields
+        api_fields = parse_category_fields(raw_fields)
+        bundle = apply_template_fields(node_slug, api_fields)
+        logger.info(
+            "Полей для UI: %s, auto: %s",
+            len(bundle.fields),
+            len(bundle.auto_fields),
+        )
+        return bundle
 
     def resolve_category_meta(self, slug: str) -> CategoryMeta:
-        raw_nodes = fetch_category_tree_raw(self.config)
-        option = find_category_option(raw_nodes, slug)
+        option = get_category_option(slug)
         if option is None:
-            raise AvitoError(f"Категория не найдена в дереве автозагрузки: {slug}")
+            raw_nodes = fetch_category_tree_raw(self.config)
+            option = find_category_option(raw_nodes, slug)
+        if option is None:
+            raise AvitoError(f"Категория не найдена: {slug}")
         fields = parse_category_fields(fetch_category_fields_raw(self.config, slug))
         return build_category_meta(option, fields)
 

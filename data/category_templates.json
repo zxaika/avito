@@ -1,0 +1,82 @@
+{
+  "categories": [
+    {
+      "slug": "fundamentnye_raboty",
+      "path": "Услуги / Предложение услуг / Строительство / Фундаментные и бетонные работы",
+      "path_dash": "Услуги - Предложение услуг - Строительство - Фундаментные и бетонные работы",
+      "field_tags": [
+        "ListingFee",
+        "ManagerName",
+        "ContactMethod",
+        "Specialty",
+        "FoundationWorks",
+        "Foundation",
+        "FreeMeasurementVisit",
+        "WorkExperience",
+        "TeamSize",
+        "WorkDays",
+        "WorkTimeFrom",
+        "WorkTimeTo",
+        "WorkWithContract",
+        "Guarantee",
+        "MaterialPurchase",
+        "PriceList",
+        "AvitoDateEnd",
+        "EMail",
+        "AvitoStatus",
+        "CompanyName"
+      ]
+    },
+    {
+      "slug": "otdelka_derevyannykh_domov_ban_saun",
+      "path": "Услуги / Предложение услуг / Строительство / Отделка деревянных домов, бань, саун",
+      "path_dash": "Услуги - Предложение услуг - Строительство - Отделка деревянных домов, бань, саун",
+      "field_tags": [
+        "ListingFee",
+        "ManagerName",
+        "ContactMethod",
+        "WorkExperience",
+        "TeamSize",
+        "WorkDays",
+        "WorkTimeFrom",
+        "WorkTimeTo",
+        "WorkWithContract",
+        "Guarantee",
+        "MaterialPurchase",
+        "PriceList",
+        "AvitoStatus",
+        "AvitoDateEnd",
+        "EMail",
+        "CompanyName"
+      ]
+    },
+    {
+      "slug": "stroitelstvo_domov_pod_klyuch",
+      "path": "Услуги / Предложение услуг / Строительство / Строительство домов под ключ",
+      "path_dash": "Услуги - Предложение услуг - Строительство - Строительство домов под ключ",
+      "field_tags": [
+        "ListingFee",
+        "ManagerName",
+        "ContactMethod",
+        "Specialty",
+        "WorkFormat",
+        "ConstructionTechnology",
+        "WorkExperience",
+        "TeamSize",
+        "WorkDays",
+        "WorkTimeFrom",
+        "WorkTimeTo",
+        "WorkWithContract",
+        "Guarantee",
+        "Payment",
+        "MaterialPurchase",
+        "WorkingWithMortgages",
+        "PriceList",
+        "CompanyName",
+        "EMail",
+        "AvitoDateEnd",
+        "AvitoStatus"
+      ]
+    }
+  ]
+}

@@ -185,7 +185,7 @@ class CategoryTreeWorker(QObject):
 
 
 class CategoryFieldsWorker(QObject):
-    finished = pyqtSignal(list)
+    finished = pyqtSignal(object)
     error = pyqtSignal(str)
 
     def __init__(self, config: AppConfig, node_slug: str) -> None:

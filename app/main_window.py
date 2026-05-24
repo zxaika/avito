@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from PyQt5.QtCore import QTimer, QThread, QObject
+from PyQt5.QtCore import Qt, QTimer, QThread, QObject
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QApplication,
@@ -41,6 +41,7 @@ from app.avito_service import (
     WalletBalance,
     parse_comma_separated,
 )
+from app.category_templates import LISTING_FEE_LABELS
 from app.config import AppConfig, load_config, save_config
 from app.database import DraftListing, init_db
 from app.logging_setup import get_log_file, get_logger
@@ -81,7 +82,7 @@ class MainWindow(QMainWindow):
         self._threads: list[QThread] = []
         self._workers: list[QObject] = []
         self._rows: list[ListingWithStats] = []
-        self._category_field_inputs: dict[str, QLineEdit] = {}
+        self._category_field_inputs: dict[str, QWidget] = {}
         self._category_auto_fields: dict[str, str] = {}
         self._pending_publish_items: list[DraftListing] = []
         self._current_balance: WalletBalance | None = None
@@ -94,27 +95,19 @@ class MainWindow(QMainWindow):
         )
 
         self.setWindowTitle("Avito Desktop Manager")
-        self.resize(1150, 760)
+        self.resize(1150, 980)
 
         self.tabs = QTabWidget()
-
-        wallet_row = QHBoxLayout()
-        self.balance_label = QLabel("Кошелёк Avito: —")
-        self.balance_label.setWordWrap(True)
-        self.refresh_balance_btn = QPushButton("Обновить баланс")
-        self.refresh_balance_btn.clicked.connect(self._refresh_balance)
-        wallet_row.addWidget(self.balance_label, stretch=1)
-        wallet_row.addWidget(self.refresh_balance_btn)
 
         container = QWidget()
         container_layout = QVBoxLayout(container)
         container_layout.setContentsMargins(8, 8, 8, 8)
-        container_layout.addLayout(wallet_row)
         container_layout.addWidget(self.tabs)
         self.setCentralWidget(container)
 
         self._build_ads_tab()
         self._build_create_tab()
+        self._build_finance_tab()
         self._build_settings_tab()
 
         self.status = QStatusBar()
@@ -232,8 +225,17 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(widget, "Объявления")
 
     def _build_create_tab(self) -> None:
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
+        tab = QWidget()
+        tab_layout = QVBoxLayout(tab)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
 
         cat_row = QHBoxLayout()
         self.category_combo = QComboBox()
@@ -260,7 +262,7 @@ class MainWindow(QMainWindow):
         self.images_input = QLineEdit()
         self.images_input.setPlaceholderText("URL фото через запятую")
         self.description_input = QTextEdit()
-        self.description_input.setMinimumHeight(100)
+        self.description_input.setMinimumHeight(50)
 
         form.addRow("Заголовок", self.title_input)
         form.addRow("Цена, ₽", self.price_input)
@@ -272,17 +274,13 @@ class MainWindow(QMainWindow):
 
         self.category_fields_box = QGroupBox("Поля категории")
         self.category_fields_layout = QFormLayout(self.category_fields_box)
-        scroll = QScrollArea()
-        scroll.setWidget(self.category_fields_box)
-        scroll.setWidgetResizable(True)
-        scroll.setMaximumHeight(180)
-        layout.addWidget(scroll)
+        layout.addWidget(self.category_fields_box)
 
         hint = QLabel(
-            "Выберите конечную категорию в дереве (например: Услуги / Предложение услуг / "
-            "Строительство / Строительство домов под ключ). Поля Category, ServiceType и "
-            "ServiceSubtype подставятся автоматически. Несколько городов через запятую — "
-            "будет создано отдельное объявление для каждого города."
+            "Доступны 3 категории из шаблона «Категории.xlsx». После выбора категории "
+            "ниже появятся её обязательные поля с подписями на русском. "
+            "Category, ServiceType и ServiceSubtype подставляются автоматически. "
+            "Несколько городов через запятую — отдельное объявление на каждый город."
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -290,9 +288,41 @@ class MainWindow(QMainWindow):
         publish_btn = QPushButton("Опубликовать через автозагрузку")
         publish_btn.clicked.connect(self._start_publish)
         layout.addWidget(publish_btn)
+
+        scroll.setWidget(content)
+        tab_layout.addWidget(scroll)
+        self.tabs.addTab(tab, "Новое объявление")
+
+    def _build_finance_tab(self) -> None:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        wallet_box = QGroupBox("Кошелёк Avito")
+        wallet_layout = QVBoxLayout(wallet_box)
+
+        self.balance_label = QLabel("Данные не загружены")
+        self.balance_label.setWordWrap(True)
+        balance_font = self.balance_label.font()
+        balance_font.setPointSize(balance_font.pointSize() + 1)
+        self.balance_label.setFont(balance_font)
+
+        self.refresh_balance_btn = QPushButton("Обновить баланс")
+        self.refresh_balance_btn.clicked.connect(self._refresh_balance)
+
+        wallet_layout.addWidget(self.balance_label)
+        wallet_layout.addWidget(self.refresh_balance_btn, alignment=Qt.AlignLeft)
+
+        hint = QLabel(
+            "Здесь отображается баланс кошелька Avito. Перед публикацией объявлений "
+            "рекомендуется обновить баланс."
+        )
+        hint.setWordWrap(True)
+
+        layout.addWidget(wallet_box)
+        layout.addWidget(hint)
         layout.addStretch()
 
-        self.tabs.addTab(widget, "Новое объявление")
+        self.tabs.addTab(widget, "Финансы")
 
     def _build_settings_tab(self) -> None:
         widget = QWidget()
@@ -440,46 +470,80 @@ class MainWindow(QMainWindow):
             on_error=self._on_worker_error,
         )
 
-    def _on_category_fields_loaded(self, fields: list) -> None:
+    def _clear_category_field_widgets(self) -> None:
+        for widget in self._category_field_inputs.values():
+            if isinstance(widget, QLineEdit):
+                widget.clear()
+            elif isinstance(widget, QComboBox):
+                widget.setCurrentIndex(0)
+
+    def _build_category_field_widget(self, field) -> QWidget:
+        if field.values:
+            combo = QComboBox()
+            combo.setEditable(True)
+            if not field.required:
+                combo.addItem("— выберите —", "")
+            for value in field.values:
+                if field.tag == "ListingFee":
+                    combo.addItem(LISTING_FEE_LABELS.get(value, value), value)
+                else:
+                    combo.addItem(value, value)
+            if field.default:
+                index = combo.findData(field.default)
+                if index >= 0:
+                    combo.setCurrentIndex(index)
+            return combo
+
+        input_widget = QLineEdit()
+        if field.default:
+            input_widget.setText(field.default)
+        return input_widget
+
+    def _category_field_value(self, widget: QWidget) -> str:
+        if isinstance(widget, QComboBox):
+            data = widget.currentData()
+            text = widget.currentText().strip()
+            if data not in (None, ""):
+                return str(data)
+            return text
+        if isinstance(widget, QLineEdit):
+            return widget.text().strip()
+        return ""
+
+    def _on_category_fields_loaded(self, bundle) -> None:
         self._category_field_inputs.clear()
         self._category_auto_fields.clear()
         while self.category_fields_layout.rowCount():
             self.category_fields_layout.removeRow(0)
 
-        for field in fields:
+        self._category_auto_fields = dict(bundle.auto_fields)
+
+        for field in bundle.fields:
             tag = field.tag or ""
             if not tag:
-                continue
-            if field.auto_value:
-                self._category_auto_fields[tag] = field.auto_value
-                continue
-            if tag.lower() in SKIP_FIELD_TAGS:
                 continue
             label = field.label or tag
             if field.required:
                 label += " *"
-            if field.values:
-                label += f" ({', '.join(field.values[:3])}{'…' if len(field.values) > 3 else ''})"
-            input_widget = QLineEdit()
-            if field.default:
-                input_widget.setText(field.default)
+            input_widget = self._build_category_field_widget(field)
             self._category_field_inputs[tag] = input_widget
             self.category_fields_layout.addRow(label, input_widget)
 
     # ------------------------------------------------------------------ wallet
 
     def _format_balance(self, balance: WalletBalance) -> str:
-        parts = [f"Кошелёк Avito: {balance.real:,.2f} ₽".replace(",", " ")]
-        if balance.bonus > 0:
-            parts.append(f"бонусы: {balance.bonus:,.2f} ₽".replace(",", " "))
-        parts.append(f"всего: {balance.total:,.2f} ₽".replace(",", " "))
-        return " · ".join(parts)
+        lines = [
+            f"Доступно: {balance.real:,.2f} ₽".replace(",", " "),
+            f"Бонусы: {balance.bonus:,.2f} ₽".replace(",", " "),
+            f"Всего: {balance.total:,.2f} ₽".replace(",", " "),
+        ]
+        return "\n".join(lines)
 
     def _update_balance_label(self, balance: WalletBalance | None = None) -> None:
         if balance is not None:
             self._current_balance = balance
         if self._current_balance is None:
-            self.balance_label.setText("Кошелёк Avito: —")
+            self.balance_label.setText("Данные не загружены")
             return
         self.balance_label.setText(self._format_balance(self._current_balance))
 
@@ -488,7 +552,7 @@ class MainWindow(QMainWindow):
             return
         self._balance_show_error_dialog = show_credentials_warning
         self.refresh_balance_btn.setEnabled(False)
-        self.balance_label.setText("Кошелёк Avito: загрузка...")
+        self.balance_label.setText("Загрузка...")
         worker = BalanceWorker(self.config)
         thread = QThread()
         self._run_worker(
@@ -505,7 +569,7 @@ class MainWindow(QMainWindow):
 
     def _on_balance_error(self, message: str) -> None:
         self.refresh_balance_btn.setEnabled(True)
-        self.balance_label.setText("Кошелёк Avito: ошибка загрузки")
+        self.balance_label.setText("Ошибка загрузки")
         logger.error("Ошибка баланса в UI: %s", message.replace("\n", " | "))
         if self._balance_show_error_dialog:
             QMessageBox.warning(self, "Баланс", message)
@@ -781,7 +845,7 @@ class MainWindow(QMainWindow):
 
         extra_fields = dict(self._category_auto_fields)
         for tag, widget in self._category_field_inputs.items():
-            value = widget.text().strip()
+            value = self._category_field_value(widget)
             if value:
                 extra_fields[tag] = value
 
@@ -914,8 +978,7 @@ class MainWindow(QMainWindow):
         self.price_input.setValue(0)
         self.city_input.clear()
         self.images_input.clear()
-        for widget in self._category_field_inputs.values():
-            widget.clear()
+        self._clear_category_field_widgets()
 
     def _open_log_file(self) -> None:
         import os
