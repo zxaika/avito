@@ -44,7 +44,7 @@ def export_listings_report(rows: list[ListingWithStats], path: Path) -> Path:
         sheet.append(
             [
                 listing.item_id,
-                listing.category_display,
+                row.category_display,
                 listing.title,
                 listing.price,
                 listing.city,
