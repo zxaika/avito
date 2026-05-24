@@ -10,6 +10,19 @@ from pathlib import Path
 DATA_DIR = Path.home() / ".avito_desktop"
 CONFIG_PATH = DATA_DIR / "config.json"
 FEED_PATH = DATA_DIR / "autoload_feed.xml"
+PROJECT_ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+
+
+def _read_env_file(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    values: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip()
+    return values
 
 
 @dataclass
@@ -20,6 +33,7 @@ class AppConfig:
     feed_public_url: str = ""
     contact_phone: str = ""
     default_category_slug: str = ""
+    default_category_path: str = ""
     stats_period_days: int = 7
     min_views_baseline: int = 5
     drop_percent_threshold: int = 50
@@ -39,6 +53,7 @@ class AppConfig:
             feed_public_url=str(data.get("feed_public_url", "")),
             contact_phone=str(data.get("contact_phone", "")),
             default_category_slug=str(data.get("default_category_slug", "")),
+            default_category_path=str(data.get("default_category_path", "")),
             stats_period_days=int(data.get("stats_period_days", 7)),
             min_views_baseline=int(data.get("min_views_baseline", 5)),
             drop_percent_threshold=int(data.get("drop_percent_threshold", 50)),
@@ -55,10 +70,25 @@ def ensure_data_dir() -> Path:
 
 def load_config() -> AppConfig:
     ensure_data_dir()
-    if not CONFIG_PATH.exists():
-        return AppConfig()
-    data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    return AppConfig.from_dict(data)
+    if CONFIG_PATH.exists():
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        config = AppConfig.from_dict(data)
+    else:
+        config = AppConfig()
+
+    env: dict[str, str] = {}
+    for env_path in (PROJECT_ENV_PATH, Path.cwd() / ".env"):
+        if env_path.exists():
+            env.update(_read_env_file(env_path))
+
+    if not config.client_id and env.get("AVITO_CLIENT_ID"):
+        config.client_id = env["AVITO_CLIENT_ID"]
+    if not config.client_secret and env.get("AVITO_CLIENT_SECRET"):
+        config.client_secret = env["AVITO_CLIENT_SECRET"]
+    if config.user_id is None and env.get("AVITO_USER_ID", "").isdigit():
+        config.user_id = int(env["AVITO_USER_ID"])
+
+    return config
 
 
 def save_config(config: AppConfig) -> None:
