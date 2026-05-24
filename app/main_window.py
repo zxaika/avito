@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from PyQt5.QtCore import QTimer, QThread
+from PyQt5.QtCore import QTimer, QThread, QObject
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QApplication,
@@ -33,9 +33,10 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from app.avito_service import ImportResult, ListingWithStats, PublishResult
+from app.avito_service import ImportResult, ListingWithStats, PublishResult, parse_comma_separated
 from app.config import AppConfig, load_config, save_config
 from app.database import DraftListing, init_db
+from app.logging_setup import get_log_file, get_logger
 from app.workers import (
     AnalyzeWorker,
     ArchiveRequest,
@@ -60,6 +61,8 @@ SKIP_FIELD_TAGS = {
     "allowemail",
 }
 
+logger = get_logger("ui")
+
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
@@ -67,8 +70,16 @@ class MainWindow(QMainWindow):
         init_db()
         self.config = load_config()
         self._threads: list[QThread] = []
+        self._workers: list[QObject] = []
         self._rows: list[ListingWithStats] = []
         self._category_field_inputs: dict[str, QLineEdit] = {}
+        self._category_auto_fields: dict[str, str] = {}
+
+        logger.info(
+            "Конфиг: client_id=%s user_id=%s",
+            "есть" if self.config.client_id else "НЕТ",
+            self.config.user_id,
+        )
 
         self.setWindowTitle("Avito Desktop Manager")
         self.resize(1150, 760)
@@ -82,11 +93,60 @@ class MainWindow(QMainWindow):
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
+        self.status.showMessage(f"Лог: {get_log_file()}")
 
         self._scheduler_timer = QTimer(self)
         self._scheduler_timer.timeout.connect(self._on_scheduler_tick)
         self._apply_scheduler()
-        self.status.showMessage("Готово")
+
+        QTimer.singleShot(0, self._load_initial_data)
+
+    def _load_initial_data(self) -> None:
+        logger.info("Автозагрузка объявлений при старте приложения")
+        if not self._has_api_credentials():
+            logger.warning("API-ключи не заданы — автозагрузка пропущена")
+            self.status.showMessage("Укажите API-ключи в настройках или .env")
+            return
+        self.status.showMessage("Загрузка объявлений...")
+        self._load_categories(show_credentials_warning=False)
+        self._start_analyze(show_credentials_warning=False)
+
+    def _has_api_credentials(self) -> bool:
+        return bool(self.config.client_id and self.config.client_secret)
+
+    def _run_worker(
+        self,
+        worker: QObject,
+        thread: QThread,
+        *,
+        on_finished,
+        on_error=None,
+        on_partial=None,
+    ) -> None:
+        """Запуск фоновой задачи; worker хранится в self._workers (иначе GC в PyQt)."""
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        thread.started.connect(lambda: logger.debug("QThread started: %s", type(worker).__name__))
+        if on_partial is not None and hasattr(worker, "partial"):
+            worker.partial.connect(on_partial)  # type: ignore[attr-defined]
+        worker.finished.connect(on_finished)
+        if on_error is not None:
+            worker.error.connect(on_error)  # type: ignore[attr-defined]
+        worker.finished.connect(thread.quit)
+        if on_error is not None:
+            worker.error.connect(thread.quit)  # type: ignore[attr-defined]
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda: self._cleanup_thread(thread, worker))
+        self._workers.append(worker)
+        self._threads.append(thread)
+        thread.start()
+
+    def _cleanup_thread(self, thread: QThread, worker: QObject) -> None:
+        if thread in self._threads:
+            self._threads.remove(thread)
+        if worker in self._workers:
+            self._workers.remove(worker)
 
     # ------------------------------------------------------------------ tabs
 
@@ -108,19 +168,23 @@ class MainWindow(QMainWindow):
         self.import_btn.clicked.connect(self._import_selected)
         self.export_btn = QPushButton("Экспорт в Excel")
         self.export_btn.clicked.connect(self._export_excel)
+        self.open_log_btn = QPushButton("Открыть лог")
+        self.open_log_btn.clicked.connect(self._open_log_file)
         self.auto_archive_btn = QPushButton("Снять просевшие (из фида)")
         self.auto_archive_btn.clicked.connect(self._archive_flagged)
         btn_row.addWidget(self.refresh_btn)
         btn_row.addWidget(self.import_btn)
         btn_row.addWidget(self.export_btn)
+        btn_row.addWidget(self.open_log_btn)
         btn_row.addWidget(self.auto_archive_btn)
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
-        self.ads_table = QTableWidget(0, 9)
+        self.ads_table = QTableWidget(0, 10)
         self.ads_table.setHorizontalHeaderLabels(
             [
                 "ID",
+                "Категория",
                 "Заголовок",
                 "Цена",
                 "Просмотры",
@@ -131,7 +195,8 @@ class MainWindow(QMainWindow):
                 "Действие",
             ]
         )
-        self.ads_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.ads_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.ads_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.ads_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.ads_table.setSelectionMode(QTableWidget.ExtendedSelection)
         self.ads_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -148,6 +213,7 @@ class MainWindow(QMainWindow):
         self.category_combo.setMinimumWidth(400)
         self.category_combo.currentIndexChanged.connect(self._on_category_changed)
         load_cat_btn = QPushButton("Загрузить категории")
+        self.load_cat_btn = load_cat_btn
         load_cat_btn.clicked.connect(self._load_categories)
         cat_row.addWidget(QLabel("Категория Avito:"))
         cat_row.addWidget(self.category_combo, stretch=1)
@@ -161,6 +227,7 @@ class MainWindow(QMainWindow):
         self.price_input = QSpinBox()
         self.price_input.setMaximum(999_999_999)
         self.city_input = QLineEdit()
+        self.city_input.setPlaceholderText("Иваново, Кинешма, Шуя")
         self.phone_input = QLineEdit()
         self.phone_input.setText(self.config.contact_phone)
         self.images_input = QLineEdit()
@@ -170,7 +237,7 @@ class MainWindow(QMainWindow):
 
         form.addRow("Заголовок", self.title_input)
         form.addRow("Цена, ₽", self.price_input)
-        form.addRow("Город / адрес", self.city_input)
+        form.addRow("Города (через запятую)", self.city_input)
         form.addRow("Телефон", self.phone_input)
         form.addRow("Фото (URL)", self.images_input)
         form.addRow("Описание", self.description_input)
@@ -185,8 +252,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(scroll)
 
         hint = QLabel(
-            "Выберите категорию — подгрузятся обязательные поля шаблона Avito. "
-            "Публикация идёт через XML-фид автозагрузки."
+            "Выберите конечную категорию в дереве (например: Услуги / Предложение услуг / "
+            "Строительство / Строительство домов под ключ). Поля Category, ServiceType и "
+            "ServiceSubtype подставятся автоматически. Несколько городов через запятую — "
+            "будет создано отдельное объявление для каждого города."
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -219,8 +288,11 @@ class MainWindow(QMainWindow):
         self.feed_url_input = QLineEdit(self.config.feed_public_url)
         self.feed_url_input.setPlaceholderText("https://example.com/autoload_feed.xml")
         self.contact_phone_setting = QLineEdit(self.config.contact_phone)
+        self.default_category_label = QLabel(self.config.default_category_path or "—")
+        self.default_category_label.setWordWrap(True)
         feed_form.addRow("Публичный URL фида", self.feed_url_input)
         feed_form.addRow("Телефон по умолчанию", self.contact_phone_setting)
+        feed_form.addRow("Категория по умолчанию", self.default_category_label)
 
         rules_box = QGroupBox("Правила снятия по просмотрам")
         rules_form = QFormLayout(rules_box)
@@ -282,22 +354,19 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ categories
 
-    def _load_categories(self) -> None:
-        if not self._validate_api_config():
+    def _load_categories(self, *, show_credentials_warning: bool = True) -> None:
+        if not self._validate_api_config(show_warning=show_credentials_warning):
             return
-        self._set_busy(True, "Загрузка категорий Avito...")
+        self.load_cat_btn.setEnabled(False)
+        self.status.showMessage("Загрузка категорий Avito...")
         worker = CategoryTreeWorker(self.config)
         thread = QThread()
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(self._on_categories_loaded)
-        worker.error.connect(self._on_worker_error)
-        worker.finished.connect(thread.quit)
-        worker.error.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.start()
-        self._threads.append(thread)
+        self._run_worker(
+            worker,
+            thread,
+            on_finished=self._on_categories_loaded,
+            on_error=self._on_worker_error,
+        )
 
     def _on_categories_loaded(self, categories: list) -> None:
         self.category_combo.blockSignals(True)
@@ -308,8 +377,11 @@ class MainWindow(QMainWindow):
             index = self.category_combo.findData(self.config.default_category_slug)
             if index >= 0:
                 self.category_combo.setCurrentIndex(index)
+        if self.config.default_category_path:
+            self.default_category_label.setText(self.config.default_category_path)
         self.category_combo.blockSignals(False)
-        self._set_busy(False, f"Загружено категорий: {len(categories)}")
+        self.load_cat_btn.setEnabled(True)
+        self.status.showMessage(f"Загружено категорий: {len(categories)}")
         if self.category_combo.currentData():
             self._load_category_fields(str(self.category_combo.currentData()))
 
@@ -321,31 +393,37 @@ class MainWindow(QMainWindow):
     def _load_category_fields(self, node_slug: str) -> None:
         worker = CategoryFieldsWorker(self.config, node_slug)
         thread = QThread()
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(self._on_category_fields_loaded)
-        worker.error.connect(self._on_worker_error)
-        worker.finished.connect(thread.quit)
-        worker.error.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.start()
-        self._threads.append(thread)
+        self._run_worker(
+            worker,
+            thread,
+            on_finished=self._on_category_fields_loaded,
+            on_error=self._on_worker_error,
+        )
 
     def _on_category_fields_loaded(self, fields: list) -> None:
         self._category_field_inputs.clear()
+        self._category_auto_fields.clear()
         while self.category_fields_layout.rowCount():
             self.category_fields_layout.removeRow(0)
 
         for field in fields:
-            slug = field.slug or ""
-            if not slug or slug.lower() in SKIP_FIELD_TAGS:
+            tag = field.tag or ""
+            if not tag:
                 continue
-            label = field.title or slug
+            if field.auto_value:
+                self._category_auto_fields[tag] = field.auto_value
+                continue
+            if tag.lower() in SKIP_FIELD_TAGS:
+                continue
+            label = field.label or tag
             if field.required:
                 label += " *"
+            if field.values:
+                label += f" ({', '.join(field.values[:3])}{'…' if len(field.values) > 3 else ''})"
             input_widget = QLineEdit()
-            self._category_field_inputs[slug] = input_widget
+            if field.default:
+                input_widget.setText(field.default)
+            self._category_field_inputs[tag] = input_widget
             self.category_fields_layout.addRow(label, input_widget)
 
     # ------------------------------------------------------------------ settings
@@ -353,6 +431,7 @@ class MainWindow(QMainWindow):
     def _save_settings(self) -> None:
         user_id_raw = self.user_id_input.text().strip()
         slug = self.category_combo.currentData()
+        category_path = self.category_combo.currentText().strip()
         self.config = AppConfig(
             client_id=self.client_id_input.text().strip(),
             client_secret=self.client_secret_input.text().strip(),
@@ -360,6 +439,7 @@ class MainWindow(QMainWindow):
             feed_public_url=self.feed_url_input.text().strip(),
             contact_phone=self.contact_phone_setting.text().strip(),
             default_category_slug=str(slug) if slug else self.config.default_category_slug,
+            default_category_path=category_path if slug else self.config.default_category_path,
             stats_period_days=self.period_spin.value(),
             min_views_baseline=self.baseline_spin.value(),
             drop_percent_threshold=self.drop_spin.value(),
@@ -369,42 +449,51 @@ class MainWindow(QMainWindow):
         )
         save_config(self.config)
         self.phone_input.setText(self.config.contact_phone)
+        if self.config.default_category_path:
+            self.default_category_label.setText(self.config.default_category_path)
         self._apply_scheduler()
         self.status.showMessage("Настройки сохранены", 3000)
 
-    def _validate_api_config(self) -> bool:
-        if not self.config.client_id or not self.config.client_secret:
+    def _validate_api_config(self, *, show_warning: bool = True) -> bool:
+        if self._has_api_credentials():
+            return True
+        if show_warning:
             QMessageBox.warning(
                 self,
                 "Настройки",
-                "Укажите Client ID и Client Secret на вкладке «Настройки».",
+                "Укажите Client ID и Client Secret на вкладке «Настройки» или в файле .env.",
             )
-            return False
-        return True
+        return False
 
     # ------------------------------------------------------------------ analyze
 
-    def _start_analyze(self) -> None:
-        if not self._validate_api_config():
+    def _start_analyze(self, *, show_credentials_warning: bool = True) -> None:
+        if not self._validate_api_config(show_warning=show_credentials_warning):
             return
-        self._set_busy(True, "Загрузка объявлений и статистики...")
-        worker = AnalyzeWorker(self.config)
+        logger.info("Запуск обновления объявлений (UI)")
+        self._set_busy(True, "Загрузка объявлений...")
+        worker = AnalyzeWorker()
         thread = QThread()
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(self._on_analyze_finished)
-        worker.error.connect(self._on_worker_error)
-        worker.finished.connect(thread.quit)
-        worker.error.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.start()
-        self._threads.append(thread)
+        self._run_worker(
+            worker,
+            thread,
+            on_partial=self._on_analyze_partial,
+            on_finished=self._on_analyze_finished,
+            on_error=self._on_worker_error,
+        )
+
+    def _on_analyze_partial(self, rows: list) -> None:
+        self._rows = rows
+        self._fill_ads_table(rows)
+        self.status.showMessage(f"Загружено {len(rows)} объявлений, получаю статистику...")
+        logger.info("Таблица обновлена (превью): %s строк", len(rows))
 
     def _on_analyze_finished(self, rows: list) -> None:
         self._rows = rows
         self._fill_ads_table(rows)
-        self._set_busy(False, f"Загружено объявлений: {len(rows)}")
+        msg = f"Загружено объявлений: {len(rows)}"
+        logger.info(msg)
+        self._set_busy(False, msg)
 
         if self.config.auto_archive_enabled:
             flagged = [r for r in rows if r.should_archive and r.in_local_feed]
@@ -417,26 +506,27 @@ class MainWindow(QMainWindow):
             listing = row.listing
             item_id = listing.item_id or ""
             self.ads_table.setItem(row_idx, 0, QTableWidgetItem(str(item_id)))
-            self.ads_table.setItem(row_idx, 1, QTableWidgetItem(listing.title or ""))
-            self.ads_table.setItem(row_idx, 2, QTableWidgetItem(str(listing.price or "")))
-            self.ads_table.setItem(row_idx, 3, QTableWidgetItem(str(row.current_views)))
-            self.ads_table.setItem(row_idx, 4, QTableWidgetItem(str(row.previous_views)))
+            self.ads_table.setItem(row_idx, 1, QTableWidgetItem(row.category_display or "—"))
+            self.ads_table.setItem(row_idx, 2, QTableWidgetItem(listing.title or ""))
+            self.ads_table.setItem(row_idx, 3, QTableWidgetItem(str(listing.price or "")))
+            self.ads_table.setItem(row_idx, 4, QTableWidgetItem(str(row.current_views)))
+            self.ads_table.setItem(row_idx, 5, QTableWidgetItem(str(row.previous_views)))
             delta = "—" if row.views_delta_pct is None else f"{row.views_delta_pct:+.1f}"
-            self.ads_table.setItem(row_idx, 5, QTableWidgetItem(delta))
+            self.ads_table.setItem(row_idx, 6, QTableWidgetItem(delta))
 
             status = "Просадка" if row.should_archive else "OK"
             status_item = QTableWidgetItem(status)
             if row.should_archive:
                 status_item.setBackground(QColor("#ffe0e0"))
-            self.ads_table.setItem(row_idx, 6, status_item)
+            self.ads_table.setItem(row_idx, 7, status_item)
 
             feed_item = QTableWidgetItem("Да" if row.in_local_feed else "Нет")
-            self.ads_table.setItem(row_idx, 7, feed_item)
+            self.ads_table.setItem(row_idx, 8, feed_item)
 
             btn = QPushButton("Снять")
             btn.setEnabled(row.in_local_feed)
             btn.clicked.connect(lambda _checked, r=row: self._archive_single(r))
-            self.ads_table.setCellWidget(row_idx, 8, btn)
+            self.ads_table.setCellWidget(row_idx, 9, btn)
 
     # ------------------------------------------------------------------ import / export
 
@@ -470,16 +560,12 @@ class MainWindow(QMainWindow):
         self._set_busy(True, "Импорт объявлений в фид...")
         worker = ImportWorker(self.config, to_import)
         thread = QThread()
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(self._on_import_finished)
-        worker.error.connect(self._on_worker_error)
-        worker.finished.connect(thread.quit)
-        worker.error.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.start()
-        self._threads.append(thread)
+        self._run_worker(
+            worker,
+            thread,
+            on_finished=self._on_import_finished,
+            on_error=self._on_worker_error,
+        )
 
     def _on_import_finished(self, result: ImportResult) -> None:
         msg = f"Импортировано: {result.imported}, пропущено: {result.skipped}"
@@ -506,16 +592,12 @@ class MainWindow(QMainWindow):
         self._set_busy(True, "Экспорт в Excel...")
         worker = ExportExcelWorker(self._rows, Path(path))
         thread = QThread()
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(self._on_export_finished)
-        worker.error.connect(self._on_worker_error)
-        worker.finished.connect(thread.quit)
-        worker.error.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.start()
-        self._threads.append(thread)
+        self._run_worker(
+            worker,
+            thread,
+            on_finished=self._on_export_finished,
+            on_error=self._on_worker_error,
+        )
 
     def _on_export_finished(self, path: str) -> None:
         self._set_busy(False, f"Отчёт сохранён: {path}")
@@ -562,16 +644,12 @@ class MainWindow(QMainWindow):
         )
         worker = ArchiveWorker(self.config, request)
         thread = QThread()
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(lambda result: self._on_archive_finished(result, rows[1:]))
-        worker.error.connect(self._on_worker_error)
-        worker.finished.connect(thread.quit)
-        worker.error.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.start()
-        self._threads.append(thread)
+        self._run_worker(
+            worker,
+            thread,
+            on_finished=lambda result: self._on_archive_finished(result, rows[1:]),
+            on_error=self._on_worker_error,
+        )
 
     def _on_archive_finished(self, result: PublishResult, remaining: list[ListingWithStats]) -> None:
         if remaining:
@@ -598,70 +676,112 @@ class MainWindow(QMainWindow):
             return
 
         title = self.title_input.text().strip()
-        category_label = self.category_combo.currentText().strip()
+        category_path = self.category_combo.currentText().strip()
         category_slug = self.category_combo.currentData()
+        category_value = self._category_auto_fields.get("Category", "")
         if not title:
             QMessageBox.warning(self, "Публикация", "Заполните заголовок.")
             return
-        if not category_label:
+        if not category_path or not category_slug:
             QMessageBox.warning(self, "Публикация", "Загрузите и выберите категорию Avito.")
             return
+        if not category_value:
+            QMessageBox.warning(
+                self,
+                "Публикация",
+                "Не удалось определить поля категории. Подождите загрузку шаблона.",
+            )
+            return
 
-        extra_fields = {
-            slug: widget.text().strip()
-            for slug, widget in self._category_field_inputs.items()
-            if widget.text().strip()
-        }
+        extra_fields = dict(self._category_auto_fields)
+        for tag, widget in self._category_field_inputs.items():
+            value = widget.text().strip()
+            if value:
+                extra_fields[tag] = value
 
-        images = [part.strip() for part in self.images_input.text().split(",") if part.strip()]
-        item = DraftListing(
-            ad_id=str(uuid.uuid4())[:8],
-            title=title,
-            description=self.description_input.toPlainText().strip(),
-            price=self.price_input.value(),
-            category=category_label,
-            category_slug=str(category_slug) if category_slug else "",
-            city=self.city_input.text().strip(),
-            phone=self.phone_input.text().strip() or self.config.contact_phone,
-            images=images,
-            extra_fields=extra_fields,
-            status="draft",
-            created_at=datetime.now().isoformat(timespec="seconds"),
-        )
+        cities = parse_comma_separated(self.city_input.text())
+        if not cities:
+            QMessageBox.warning(self, "Публикация", "Укажите хотя бы один город через запятую.")
+            return
+
+        images = parse_comma_separated(self.images_input.text())
+        description = self.description_input.toPlainText().strip()
+        phone = self.phone_input.text().strip() or self.config.contact_phone
+        created_at = datetime.now().isoformat(timespec="seconds")
+        items = [
+            DraftListing(
+                ad_id=str(uuid.uuid4())[:8],
+                title=title,
+                description=description,
+                price=self.price_input.value(),
+                category=category_value,
+                category_path=category_path,
+                category_slug=str(category_slug) if category_slug else "",
+                city=city,
+                phone=phone,
+                images=images,
+                extra_fields=dict(extra_fields),
+                status="draft",
+                created_at=created_at,
+            )
+            for city in cities
+        ]
 
         if category_slug:
             self.config.default_category_slug = str(category_slug)
+            self.config.default_category_path = category_path
             save_config(self.config)
 
-        self._set_busy(True, "Публикация объявления...")
-        worker = PublishWorker(self.config, item)
+        busy_msg = (
+            f"Публикация объявления в {len(cities)} городах..."
+            if len(cities) > 1
+            else "Публикация объявления..."
+        )
+        self._set_busy(True, busy_msg)
+        worker = PublishWorker(self.config, items)
         thread = QThread()
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(self._on_publish_finished)
-        worker.error.connect(self._on_worker_error)
-        worker.finished.connect(thread.quit)
-        worker.error.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.start()
-        self._threads.append(thread)
+        self._run_worker(
+            worker,
+            thread,
+            on_finished=self._on_publish_finished,
+            on_error=self._on_worker_error,
+        )
 
     def _on_publish_finished(self, result: PublishResult) -> None:
-        msg = f"Фид сохранён ({result.items_count} объявл.): {result.feed_path}"
+        if result.added_count > 1 and result.cities:
+            msg = (
+                f"Добавлено {result.added_count} объявлений для городов: "
+                f"{', '.join(result.cities)}.\n"
+                f"Всего в фиде: {result.items_count}. Файл: {result.feed_path}"
+            )
+        else:
+            msg = f"Фид сохранён ({result.items_count} объявл.): {result.feed_path}"
         if result.report_id:
-            msg += f". Загрузка запущена, отчёт #{result.report_id}"
+            msg += f"\nЗагрузка запущена, отчёт #{result.report_id}"
         QMessageBox.information(self, "Публикация", msg)
-        self._set_busy(False, msg)
+        self._set_busy(False, msg.replace("\n", " "))
         self.title_input.clear()
         self.description_input.clear()
         self.price_input.setValue(0)
+        self.city_input.clear()
         self.images_input.clear()
         for widget in self._category_field_inputs.values():
             widget.clear()
 
+    def _open_log_file(self) -> None:
+        import os
+
+        log_path = get_log_file()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        if not log_path.exists():
+            log_path.write_text("", encoding="utf-8")
+        logger.info("Открытие лог-файла: %s", log_path)
+        os.startfile(log_path)  # noqa: S606 — Windows only
+
     def _on_worker_error(self, message: str) -> None:
-        self._set_busy(False, "Ошибка")
+        self._set_busy(False, f"Ошибка — см. лог: {get_log_file().name}")
+        self.load_cat_btn.setEnabled(True)
+        logger.error("Ошибка в UI: %s", message.replace("\n", " | "))
         QMessageBox.critical(self, "Ошибка", message)
 
     def _set_busy(self, busy: bool, message: str) -> None:
@@ -675,8 +795,11 @@ class MainWindow(QMainWindow):
 def run_app() -> None:
     import sys
 
+    ui_logger = get_logger("ui")
+    ui_logger.info("Инициализация QApplication")
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     window = MainWindow()
     window.show()
+    ui_logger.info("Главное окно отображено")
     sys.exit(app.exec_())

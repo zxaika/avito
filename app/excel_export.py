@@ -12,9 +12,9 @@ from app.avito_service import ListingWithStats
 
 HEADERS = [
     "ID объявления",
+    "Категория",
     "Заголовок",
     "Цена",
-    "Категория",
     "Город",
     "URL",
     "Просмотры (тек.)",
@@ -44,9 +44,9 @@ def export_listings_report(rows: list[ListingWithStats], path: Path) -> Path:
         sheet.append(
             [
                 listing.item_id,
+                row.category_display,
                 listing.title,
                 listing.price,
-                listing.category,
                 listing.city,
                 listing.url,
                 row.current_views,

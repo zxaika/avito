@@ -22,8 +22,9 @@ def build_autoload_xml(items: list[DraftListing]) -> str:
         _add_text(ad, "Category", item.category)
 
         for tag, value in item.extra_fields.items():
-            if value.strip():
-                _add_text(ad, tag, value.strip())
+            if tag == "Category" or not value.strip():
+                continue
+            _add_text(ad, tag, value.strip())
 
         _add_text(ad, "Title", item.title)
 

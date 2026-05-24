@@ -24,6 +24,7 @@ class DraftListing:
     images: list[str]
     avito_item_id: int | None = None
     category_slug: str = ""
+    category_path: str = ""
     extra_fields: dict[str, str] = field(default_factory=dict)
     in_feed: bool = True
     status: str = "draft"  # draft | published | archived
@@ -57,6 +58,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE feed_items ADD COLUMN extra_fields_json TEXT NOT NULL DEFAULT '{}'"
         )
+    if "category_path" not in columns:
+        conn.execute(
+            "ALTER TABLE feed_items ADD COLUMN category_path TEXT NOT NULL DEFAULT ''"
+        )
 
 
 def init_db() -> None:
@@ -74,6 +79,7 @@ def init_db() -> None:
                 images_json TEXT NOT NULL DEFAULT '[]',
                 avito_item_id INTEGER,
                 category_slug TEXT NOT NULL DEFAULT '',
+                category_path TEXT NOT NULL DEFAULT '',
                 extra_fields_json TEXT NOT NULL DEFAULT '{}',
                 in_feed INTEGER NOT NULL DEFAULT 1,
                 status TEXT NOT NULL DEFAULT 'draft',
@@ -101,9 +107,9 @@ def save_feed_item(item: DraftListing) -> None:
             """
             INSERT INTO feed_items (
                 ad_id, title, description, price, category, city, phone,
-                images_json, avito_item_id, category_slug, extra_fields_json,
+                images_json, avito_item_id, category_slug, category_path, extra_fields_json,
                 in_feed, status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(ad_id) DO UPDATE SET
                 title=excluded.title,
                 description=excluded.description,
@@ -114,6 +120,7 @@ def save_feed_item(item: DraftListing) -> None:
                 images_json=excluded.images_json,
                 avito_item_id=excluded.avito_item_id,
                 category_slug=excluded.category_slug,
+                category_path=excluded.category_path,
                 extra_fields_json=excluded.extra_fields_json,
                 in_feed=excluded.in_feed,
                 status=excluded.status
@@ -129,6 +136,7 @@ def save_feed_item(item: DraftListing) -> None:
                 json.dumps(item.images, ensure_ascii=False),
                 item.avito_item_id,
                 item.category_slug,
+                item.category_path,
                 json.dumps(item.extra_fields, ensure_ascii=False),
                 1 if item.in_feed else 0,
                 item.status,
@@ -208,6 +216,7 @@ def get_stats_snapshot(item_id: int, period_label: str) -> StatsSnapshot | None:
 def _row_to_item(row: sqlite3.Row) -> DraftListing:
     extra_raw = row["extra_fields_json"] if "extra_fields_json" in row.keys() else "{}"
     slug_raw = row["category_slug"] if "category_slug" in row.keys() else ""
+    path_raw = row["category_path"] if "category_path" in row.keys() else ""
     return DraftListing(
         ad_id=row["ad_id"],
         title=row["title"],
@@ -219,6 +228,7 @@ def _row_to_item(row: sqlite3.Row) -> DraftListing:
         images=json.loads(row["images_json"]),
         avito_item_id=row["avito_item_id"],
         category_slug=slug_raw or "",
+        category_path=path_raw or "",
         extra_fields=json.loads(extra_raw or "{}"),
         in_feed=bool(row["in_feed"]),
         status=row["status"],

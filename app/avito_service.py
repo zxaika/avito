@@ -2,15 +2,25 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from avito import AvitoClient
-from avito.ads.models import AutoloadField, Listing, ListingStats
+from avito.ads.models import Listing, ListingStats
 from avito.core.exceptions import AvitoError
 
-from app.category_utils import flatten_category_tree
+from app.autoload_api import fetch_category_fields_raw, fetch_category_tree_raw
+from app.avito_client_factory import create_avito_client
+from app.category_utils import (
+    AutoloadFeedField,
+    CategoryMeta,
+    build_category_meta,
+    find_category_option,
+    flatten_category_tree,
+    parse_category_fields,
+)
 from app.config import AppConfig, FEED_PATH, apply_config_to_env
 from app.database import (
     DraftListing,
@@ -22,11 +32,21 @@ from app.database import (
     save_stats_snapshot,
 )
 from app.feed_builder import write_feed_file
+from app.logging_setup import get_logger
+
+logger = get_logger("service")
+STATS_BATCH_SIZE = 20
+
+
+def parse_comma_separated(raw: str) -> list[str]:
+    """Разбивает строку по запятым, убирает пустые элементы."""
+    return [part.strip() for part in raw.split(",") if part.strip()]
 
 
 @dataclass
 class ListingWithStats:
     listing: Listing
+    category_display: str
     current_views: int
     previous_views: int
     current_contacts: int
@@ -41,6 +61,8 @@ class PublishResult:
     feed_path: Path
     report_id: int | None
     items_count: int
+    added_count: int = 0
+    cities: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -55,34 +77,68 @@ class AvitoService:
         apply_config_to_env(config)
 
     def _client(self) -> AvitoClient:
-        return AvitoClient(
-            client_id=self.config.client_id,
-            client_secret=self.config.client_secret,
-        )
+        return create_avito_client(self.config)
 
     def resolve_user_id(self, client: AvitoClient) -> int:
         if self.config.user_id:
+            logger.debug("user_id из конфигурации: %s", self.config.user_id)
             return self.config.user_id
+        started = time.perf_counter()
+        logger.info("Запрос профиля account().get_self()")
         profile = client.account().get_self()
-        if profile.id is None:
+        elapsed = time.perf_counter() - started
+        logger.info(
+            "Профиль получен за %.2f с: user_id=%s name=%s",
+            elapsed,
+            profile.user_id,
+            profile.name,
+        )
+        if profile.user_id is None:
             raise AvitoError("Не удалось определить user_id.")
-        return profile.id
+        return profile.user_id
 
     def fetch_active_listings(self) -> list[Listing]:
+        started = time.perf_counter()
+        logger.info("Загрузка активных объявлений (status=active)")
         with self._client() as client:
             user_id = self.resolve_user_id(client)
+            list_started = time.perf_counter()
             items = client.ad(user_id=user_id).list(status="active", page_size=100)
-            return items.materialize()
+            listings = list(items.materialize())
+            logger.info(
+                "Объявления загружены за %.2f с: count=%s user_id=%s",
+                time.perf_counter() - list_started,
+                len(listings),
+                user_id,
+            )
+        logger.info(
+            "fetch_active_listings завершён за %.2f с, всего %s объявлений",
+            time.perf_counter() - started,
+            len(listings),
+        )
+        return listings
 
     def fetch_category_tree(self) -> list[tuple[str, str]]:
-        with self._client() as client:
-            tree = client.autoload_profile().get_tree()
-            return flatten_category_tree(tree.items)
+        logger.info("Загрузка дерева категорий автозагрузки")
+        raw_nodes = fetch_category_tree_raw(self.config)
+        categories = flatten_category_tree(raw_nodes)
+        logger.info("Категорий загружено: %s", len(categories))
+        return categories
 
-    def fetch_category_fields(self, node_slug: str) -> list[AutoloadField]:
-        with self._client() as client:
-            result = client.autoload_profile().get_node_fields(node_slug=node_slug)
-            return result.items
+    def fetch_category_fields(self, node_slug: str) -> list[AutoloadFeedField]:
+        logger.info("Загрузка полей категории: %s", node_slug)
+        raw_fields = fetch_category_fields_raw(self.config, node_slug)
+        fields = parse_category_fields(raw_fields)
+        logger.info("Полей категории: %s", len(fields))
+        return fields
+
+    def resolve_category_meta(self, slug: str) -> CategoryMeta:
+        raw_nodes = fetch_category_tree_raw(self.config)
+        option = find_category_option(raw_nodes, slug)
+        if option is None:
+            raise AvitoError(f"Категория не найдена в дереве автозагрузки: {slug}")
+        fields = parse_category_fields(fetch_category_fields_raw(self.config, slug))
+        return build_category_meta(option, fields)
 
     def fetch_stats_for_items(
         self,
@@ -91,6 +147,7 @@ class AvitoService:
         period_days: int,
     ) -> tuple[dict[int, ListingStats], dict[int, ListingStats]]:
         if not item_ids:
+            logger.info("Статистика: список item_ids пуст, пропуск")
             return {}, {}
 
         today = date.today()
@@ -99,40 +156,144 @@ class AvitoService:
         previous_end = current_start - timedelta(days=1)
         previous_start = previous_end - timedelta(days=period_days - 1)
 
+        logger.info(
+            "Статистика для %s объявлений, период %s дней: текущий %s..%s, прошлый %s..%s",
+            len(item_ids),
+            period_days,
+            current_start,
+            current_end,
+            previous_start,
+            previous_end,
+        )
+
+        current_map: dict[int, ListingStats] = {}
+        previous_map: dict[int, ListingStats] = {}
+        batches = [
+            item_ids[i : i + STATS_BATCH_SIZE]
+            for i in range(0, len(item_ids), STATS_BATCH_SIZE)
+        ]
+        logger.info("Статистика: %s пакет(ов) по до %s ID", len(batches), STATS_BATCH_SIZE)
+
         with self._client() as client:
             user_id = self.resolve_user_id(client)
             stats_api = client.ad_stats(user_id=user_id)
 
-            current = stats_api.get_item_stats(
-                date_from=current_start.isoformat(),
-                date_to=current_end.isoformat(),
-                item_ids=item_ids,
-            )
-            previous = stats_api.get_item_stats(
-                date_from=previous_start.isoformat(),
-                date_to=previous_end.isoformat(),
-                item_ids=item_ids,
-            )
+            for index, batch in enumerate(batches, start=1):
+                batch_started = time.perf_counter()
+                logger.info("Пакет %s/%s: item_ids=%s", index, len(batches), batch)
 
-        current_map = {s.item_id: s for s in current.items if s.item_id is not None}
-        previous_map = {s.item_id: s for s in previous.items if s.item_id is not None}
+                cur = stats_api.get_item_stats(
+                    date_from=current_start.isoformat(),
+                    date_to=current_end.isoformat(),
+                    item_ids=batch,
+                )
+                prev = stats_api.get_item_stats(
+                    date_from=previous_start.isoformat(),
+                    date_to=previous_end.isoformat(),
+                    item_ids=batch,
+                )
+
+                for stat in cur.items:
+                    if stat.item_id is not None:
+                        current_map[stat.item_id] = stat
+                for stat in prev.items:
+                    if stat.item_id is not None:
+                        previous_map[stat.item_id] = stat
+
+                logger.info(
+                    "Пакет %s/%s готов за %.2f с (ответ: current=%s, previous=%s)",
+                    index,
+                    len(batches),
+                    time.perf_counter() - batch_started,
+                    len(cur.items),
+                    len(prev.items),
+                )
+
+        logger.info(
+            "Статистика собрана: current_map=%s previous_map=%s",
+            len(current_map),
+            len(previous_map),
+        )
         return current_map, previous_map
 
-    def analyze_listings(self) -> list[ListingWithStats]:
-        listings = self.fetch_active_listings()
-        item_ids = [item.item_id for item in listings if item.item_id is not None]
-        current_map, previous_map = self.fetch_stats_for_items(
-            item_ids,
-            period_days=self.config.stats_period_days,
-        )
-
-        feed_items = list_feed_items()
-        feed_by_avito_id = {
+    def _feed_by_avito_id(self) -> dict[int, str]:
+        return {
             item.avito_item_id: item.ad_id
-            for item in feed_items
+            for item in list_feed_items()
             if item.avito_item_id is not None
         }
 
+    def _feed_items_by_avito_id(self) -> dict[int, DraftListing]:
+        return {
+            item.avito_item_id: item
+            for item in list_feed_items()
+            if item.avito_item_id is not None
+        }
+
+    def _category_display(
+        self,
+        listing: Listing,
+        feed_item: DraftListing | None,
+    ) -> str:
+        if feed_item and feed_item.category_path:
+            return feed_item.category_path
+        if feed_item and feed_item.category_slug:
+            try:
+                return self.resolve_category_meta(feed_item.category_slug).path
+            except AvitoError:
+                pass
+        if self.config.default_category_path:
+            return self.config.default_category_path
+        if listing.category:
+            return f"{listing.category} (без подкатегории — укажите категорию в настройках)"
+        return "—"
+
+    def build_preview_rows(self, listings: list[Listing]) -> list[ListingWithStats]:
+        feed_by_avito_id = self._feed_by_avito_id()
+        feed_items = self._feed_items_by_avito_id()
+        result: list[ListingWithStats] = []
+        for listing in listings:
+            item_id = listing.item_id
+            if item_id is None:
+                continue
+            feed_ad_id = feed_by_avito_id.get(item_id)
+            result.append(
+                ListingWithStats(
+                    listing=listing,
+                    category_display=self._category_display(
+                        listing,
+                        feed_items.get(item_id),
+                    ),
+                    current_views=0,
+                    previous_views=0,
+                    current_contacts=0,
+                    views_delta_pct=None,
+                    should_archive=False,
+                    in_local_feed=feed_ad_id is not None,
+                    feed_ad_id=feed_ad_id,
+                )
+            )
+        logger.info("Превью объявлений без статистики: %s", len(result))
+        return result
+
+    def complete_listings_with_stats(self, listings: list[Listing]) -> list[ListingWithStats]:
+        total_started = time.perf_counter()
+        item_ids = [item.item_id for item in listings if item.item_id is not None]
+        current_map: dict[int, ListingStats] = {}
+        previous_map: dict[int, ListingStats] = {}
+
+        try:
+            current_map, previous_map = self.fetch_stats_for_items(
+                item_ids,
+                period_days=self.config.stats_period_days,
+            )
+        except AvitoError as exc:
+            logger.warning("Статистика недоступна: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Ошибка статистики: %s", exc)
+
+        feed_by_avito_id = self._feed_by_avito_id()
+        feed_items = self._feed_items_by_avito_id()
         now = date.today().isoformat()
         period_label = f"current_{self.config.stats_period_days}d"
         prev_label = f"previous_{self.config.stats_period_days}d"
@@ -180,6 +341,10 @@ class AvitoService:
             result.append(
                 ListingWithStats(
                     listing=listing,
+                    category_display=self._category_display(
+                        listing,
+                        feed_items.get(item_id),
+                    ),
                     current_views=current_views,
                     previous_views=previous_views,
                     current_contacts=current_contacts,
@@ -191,9 +356,33 @@ class AvitoService:
             )
 
         result.sort(key=lambda row: (not row.should_archive, row.current_views))
+        flagged = sum(1 for row in result if row.should_archive)
+        logger.info(
+            "complete_listings_with_stats за %.2f с | объявлений=%s | просадка=%s",
+            time.perf_counter() - total_started,
+            len(result),
+            flagged,
+        )
         return result
 
+    def analyze_listings(self) -> list[ListingWithStats]:
+        logger.info("=== analyze_listings: старт ===")
+        listings = self.fetch_active_listings()
+        if not listings:
+            logger.warning("API вернул 0 активных объявлений")
+            return []
+        return self.complete_listings_with_stats(listings)
+
     def import_listings_to_feed(self, listings: list[Listing]) -> ImportResult:
+        logger.info("Импорт в фид: %s объявлений", len(listings))
+        if not self.config.default_category_slug:
+            raise AvitoError(
+                "Укажите категорию автозагрузки по умолчанию на вкладке «Новое объявление» "
+                "и сохраните настройки. Нужен полный путь, например: "
+                "Услуги / Предложение услуг / Строительство / Строительство домов под ключ."
+            )
+
+        category_meta = self.resolve_category_meta(self.config.default_category_slug)
         imported = 0
         skipped = 0
 
@@ -212,13 +401,14 @@ class AvitoService:
                 title=listing.title or f"Объявление {item_id}",
                 description=listing.description or listing.title or "",
                 price=price,
-                category=listing.category or "",
-                category_slug=self.config.default_category_slug,
+                category=category_meta.category,
+                category_path=category_meta.path,
+                category_slug=category_meta.slug,
                 city=listing.city or "",
                 phone=self.config.contact_phone,
                 images=[],
                 avito_item_id=item_id,
-                extra_fields={},
+                extra_fields=dict(category_meta.auto_fields),
                 in_feed=True,
                 status="published",
                 created_at=datetime.now().isoformat(timespec="seconds"),
@@ -226,6 +416,7 @@ class AvitoService:
             save_feed_item(item)
             imported += 1
 
+        logger.info("Импорт завершён: imported=%s skipped=%s", imported, skipped)
         return ImportResult(imported=imported, skipped=skipped)
 
     def _should_archive(
@@ -245,6 +436,7 @@ class AvitoService:
 
     def publish_feed(self) -> PublishResult:
         items = [item for item in list_feed_items(in_feed_only=True)]
+        logger.info("Публикация фида: %s объявлений", len(items))
         feed_path = write_feed_file(items, FEED_PATH)
 
         report_id: int | None = None
@@ -252,18 +444,35 @@ class AvitoService:
             with self._client() as client:
                 upload = client.autoload_profile().upload_by_url(url=self.config.feed_public_url)
                 report_id = upload.report_id
+                logger.info("Автозагрузка запущена, report_id=%s", report_id)
 
         return PublishResult(
             feed_path=feed_path,
             report_id=report_id,
             items_count=len(items),
+            added_count=0,
+        )
+
+    def add_listings_to_feed(self, items: list[DraftListing]) -> PublishResult:
+        if not items:
+            raise AvitoError("Нет объявлений для публикации.")
+        logger.info("Добавление в фид: %s объявлений", len(items))
+        for item in items:
+            save_feed_item(item)
+        result = self.publish_feed()
+        return PublishResult(
+            feed_path=result.feed_path,
+            report_id=result.report_id,
+            items_count=result.items_count,
+            added_count=len(items),
+            cities=[item.city for item in items],
         )
 
     def add_listing_to_feed(self, item: DraftListing) -> PublishResult:
-        save_feed_item(item)
-        return self.publish_feed()
+        return self.add_listings_to_feed([item])
 
     def archive_listing(self, *, feed_ad_id: str | None, avito_item_id: int | None) -> PublishResult:
+        logger.info("Снятие объявления: feed_ad_id=%s avito_item_id=%s", feed_ad_id, avito_item_id)
         if feed_ad_id:
             archive_feed_item(feed_ad_id)
             return self.publish_feed()
